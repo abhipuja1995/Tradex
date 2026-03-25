@@ -63,14 +63,19 @@ async def main():
     set_engine(engine)
 
     # Start the trading engine (blocking)
+    # If broker is not configured, engine stays in STOPPED state
+    # but FastAPI healthcheck still works
     try:
         await engine.start()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
         await engine.shutdown()
     except Exception as e:
-        logger.error(f"Engine error: {e}", exc_info=True)
-        await engine.shutdown()
+        logger.error(f"Engine failed to start: {e}", exc_info=True)
+        logger.info("Engine offline. FastAPI server still running for dashboard.")
+        # Keep process alive for FastAPI healthcheck
+        while True:
+            await asyncio.sleep(60)
 
 
 if __name__ == "__main__":
