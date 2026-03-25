@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     # FastAPI
     fastapi_host: str = "0.0.0.0"
     fastapi_port: int = 8100
+    port: int = 0  # Railway sets PORT env var; if set, overrides fastapi_port
+
+    @property
+    def effective_port(self) -> int:
+        """Railway sets PORT env var. Use it if available, else fastapi_port."""
+        return self.port if self.port > 0 else self.fastapi_port
 
 
 settings = Settings()
