@@ -1,4 +1,11 @@
-"""Hybrid strategy combining TradingAgents AI signals with RSI technical analysis."""
+"""Hybrid strategy combining TradingAgents AI signals with RSI technical analysis.
+
+Architecture:
+- Dhan SDK: execution layer (orders, positions, funds)
+- OpenAlgo: strategy & automation signals (optional enhancement)
+- TradingAgents: multi-agent AI signal generation
+- RSI + Support: technical confirmation layer
+"""
 
 from __future__ import annotations
 
@@ -33,13 +40,29 @@ class HybridStrategy:
     1. TradingAgents provides BUY/SELL/HOLD with confidence
     2. RSI confirms entry timing (RSI < 30 near support = BUY)
     3. Learning rules can override either layer
+
+    Dhan is used for execution; OpenAlgo provides optional strategy signals.
     """
 
-    def __init__(self, ai_signal_generator, openalgo_client, learning_rules: list[dict] | None = None):
+    def __init__(self, ai_signal_generator, broker_client, learning_rules: list[dict] | None = None):
         self.ai = ai_signal_generator
-        self.openalgo = openalgo_client
+        self.broker = broker_client  # Dhan broker for market data (LTP, candles)
         self.learning_rules = learning_rules or []
         self.watchlist = list(DEFAULT_WATCHLIST)
+
+        # Optional OpenAlgo strategy connection
+        self._openalgo = None
+        self._init_openalgo()
+
+    def _init_openalgo(self):
+        """Connect to OpenAlgo for strategy signals if configured."""
+        if settings.openalgo_api_key:
+            try:
+                from core.openalgo_client import OpenAlgoClient
+                self._openalgo = OpenAlgoClient()
+                logger.info("OpenAlgo connected as strategy/automation layer")
+            except Exception as e:
+                logger.warning(f"OpenAlgo not available: {e}")
 
     def update_watchlist(self, symbols: list[str]) -> None:
         self.watchlist = symbols
@@ -81,23 +104,46 @@ class HybridStrategy:
 
         return False, ""
 
+    async def _get_openalgo_signal(self, symbol: str) -> SignalAction | None:
+        """Get strategy signal from OpenAlgo if available.
+
+        OpenAlgo can provide additional strategy signals from its
+        built-in strategy engine (moving average crossovers, etc.)
+        This is used as an optional third confirmation layer.
+        """
+        if not self._openalgo:
+            return None
+
+        try:
+            positions = await self._openalgo.get_positions()
+            # If OpenAlgo already has a position in this symbol, it confirms the signal
+            for pos in positions:
+                if pos.get("symbol") == symbol:
+                    net_qty = int(pos.get("netqty", pos.get("net_qty", 0)))
+                    if net_qty > 0:
+                        return SignalAction.BUY
+                    elif net_qty < 0:
+                        return SignalAction.SELL
+            return SignalAction.HOLD
+        except Exception as e:
+            logger.debug(f"OpenAlgo signal unavailable for {symbol}: {e}")
+            return None
+
     async def scan(self) -> list[TradeSignal]:
         """Scan watchlist for trade signals using hybrid AI + RSI approach."""
         from core.indicators import compute_rsi, support_level, is_near_support
-        from dhanhq import dhanhq
 
         signals: list[TradeSignal] = []
         today_str = date.today().isoformat()
 
         for symbol in self.watchlist:
             try:
-                # Get current price from OpenAlgo
-                ltp = await self.openalgo.get_ltp(symbol)
+                # Get current price from Dhan broker
+                ltp = await self.broker.get_ltp(symbol)
                 if not ltp:
                     continue
 
-                # Get historical candles for RSI computation
-                # Using Dhan API directly for OHLCV data (OpenAlgo may not expose this)
+                # Get historical candles for RSI computation (via Dhan)
                 candles = await self._get_candles(symbol)
                 if candles is None or len(candles) < settings.rsi_period + 1:
                     continue
@@ -136,9 +182,13 @@ class HybridStrategy:
                     )
                     continue
 
-                # Combined confidence: weighted average (AI 60%, RSI 40%)
+                # Optional: check OpenAlgo strategy signal as third layer
+                openalgo_signal = await self._get_openalgo_signal(symbol)
+                openalgo_boost = 0.05 if openalgo_signal == SignalAction.BUY else 0.0
+
+                # Combined confidence: weighted average (AI 60%, RSI 40%) + OpenAlgo boost
                 rsi_confidence = max(0, (settings.rsi_oversold - current_rsi) / settings.rsi_oversold)
-                combined = 0.6 * ai_signal.confidence + 0.4 * rsi_confidence
+                combined = 0.6 * ai_signal.confidence + 0.4 * rsi_confidence + openalgo_boost
 
                 signals.append(TradeSignal(
                     symbol=symbol,
@@ -155,6 +205,7 @@ class HybridStrategy:
                 logger.info(
                     f"Signal: BUY {symbol} @ ₹{ltp:.2f} | "
                     f"RSI: {current_rsi:.1f} | AI: {ai_signal.confidence:.2f} | "
+                    f"OpenAlgo: {openalgo_signal or 'N/A'} | "
                     f"Combined: {combined:.2f}"
                 )
 
@@ -169,7 +220,7 @@ class HybridStrategy:
     async def _get_candles(self, symbol: str, interval: str = "5") -> Any:
         """Fetch OHLCV candles from Dhan API.
 
-        Uses dhanhq SDK directly since OpenAlgo may not expose historical data.
+        Uses Dhan SDK directly for historical data.
         """
         from config.constants import DHAN_SECURITY_IDS
         from core.indicators import candles_from_dhan_data
@@ -180,10 +231,8 @@ class HybridStrategy:
             return None
 
         try:
+            from dhanhq import dhanhq
             dhan = dhanhq(settings.dhan_client_id, settings.dhan_access_token)
-            from datetime import datetime, timedelta
-            to_date = datetime.now()
-            from_date = to_date - timedelta(days=5)
 
             response = dhan.intraday_daily_candle_data(
                 security_id=str(security_id),

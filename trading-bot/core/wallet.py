@@ -1,4 +1,4 @@
-"""Wallet balance tracking — syncs with OpenAlgo funds API and Supabase."""
+"""Wallet balance tracking — syncs with broker funds API and Supabase."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class WalletState:
 
 
 class WalletTracker:
-    """Manages wallet state with Supabase persistence and OpenAlgo fund sync."""
+    """Manages wallet state with Supabase persistence and broker fund sync."""
 
     def __init__(self):
         self._state: WalletState | None = None
@@ -40,21 +40,30 @@ class WalletTracker:
     @property
     def state(self) -> WalletState:
         if self._state is None:
-            raise RuntimeError("Wallet not initialized. Call sync() first.")
+            raise RuntimeError("Wallet not initialized. Call sync() or init_default().")
         return self._state
 
-    async def sync(self, openalgo_client) -> WalletState:
-        """Sync wallet from OpenAlgo funds API and DB.
+    def init_default(self):
+        """Initialize wallet with defaults when broker is unavailable."""
+        self._state = WalletState(
+            total_balance=settings.daily_cap_inr,
+            available_balance=settings.daily_cap_inr,
+            locked_in_trades=0,
+            daily_invested=0,
+            daily_pnl=0,
+            trade_date=date.today(),
+        )
+        logger.info(f"Wallet initialized with defaults (cap: ₹{settings.daily_cap_inr})")
 
-        On a new day, resets daily counters.
-        """
+    async def sync(self, broker_client) -> WalletState:
+        """Sync wallet from broker funds API and DB."""
         from db.client import get_wallet, reset_daily_wallet
 
         today = date.today()
         db_wallet = await get_wallet(today)
 
-        # Fetch real balance from OpenAlgo
-        funds = await openalgo_client.get_funds()
+        # Fetch real balance from broker
+        funds = await broker_client.get_funds()
         total_balance = float(funds.get("availablecash", 0))
         available_balance = total_balance
 

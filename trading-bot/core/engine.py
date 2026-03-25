@@ -17,6 +17,18 @@ logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 
 
+def _create_broker():
+    """Create the Dhan broker adapter for order execution.
+
+    Architecture:
+    - Dhan SDK = execution layer (orders, positions, funds, LTP)
+    - OpenAlgo = strategy & automation layer (connected separately)
+    """
+    from core.dhan_broker import DhanBroker
+    logger.info("Using Dhan SDK for order execution")
+    return DhanBroker()
+
+
 class TradingEngine:
     """Main trading loop that orchestrates all components.
 
@@ -24,7 +36,7 @@ class TradingEngine:
     1. risk_manager.can_trade() — check all guards
     2. ai_signals.get_signal() — TradingAgents multi-agent analysis
     3. strategy.evaluate() — hybrid AI + RSI confirmation
-    4. openalgo_client.place_order() — execute via OpenAlgo → Dhan
+    4. broker.place_order() — execute via Dhan (direct or OpenAlgo)
     5. Position monitor (every 15s): check LTP vs stop_loss/target
     6. At 15:25: force-close open positions
     7. At 15:30: learning.analyze_day(), daily summary alert
@@ -35,7 +47,7 @@ class TradingEngine:
         self._shutdown = False
 
         # Components (initialized in start())
-        self.openalgo = None
+        self.broker = None
         self.strategy = None
         self.risk_manager = None
         self.wallet = None
@@ -44,39 +56,42 @@ class TradingEngine:
 
     async def start(self):
         """Initialize all components and start the trading loop."""
-        from core.openalgo_client import OpenAlgoClient
         from core.ai_signals import AISignalGenerator
         from core.strategy import HybridStrategy
         from core.risk_manager import RiskManager
         from core.wallet import WalletTracker
-        from core.alerts import TelegramAlerter
+        from core.telegram_bot import TelegramBot
         from core.learning import LearningEngine
         from db.client import get_active_rules
 
         logger.info("Starting trading engine...")
 
-        self.openalgo = OpenAlgoClient()
+        # Create broker adapter (Dhan direct or OpenAlgo)
+        self.broker = _create_broker()
+
         self.risk_manager = RiskManager()
         self.wallet = WalletTracker()
-        self.alerter = TelegramAlerter()
         self.learning = LearningEngine()
+
+        # Use TelegramBot as the alerter (it has both commands + notifications)
+        # The bot instance may be injected by run_bot.py before start()
+        if not self.alerter:
+            self.alerter = TelegramBot()
 
         ai_generator = AISignalGenerator()
         rules = await get_active_rules()
-        self.strategy = HybridStrategy(ai_generator, self.openalgo, rules)
+        self.strategy = HybridStrategy(ai_generator, self.broker, rules)
 
-        # Sync wallet
-        await self.wallet.sync(self.openalgo)
-
-        # Register shutdown handler
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            asyncio.get_event_loop().add_signal_handler(
-                sig, lambda: asyncio.create_task(self.shutdown())
-            )
+        # Sync wallet (graceful — don't crash if broker is unavailable)
+        try:
+            await self.wallet.sync(self.broker)
+        except Exception as e:
+            logger.warning(f"Wallet sync failed (broker may be offline): {e}")
+            self.wallet.init_default()
 
         self.state = BotState.RUNNING
         logger.info("Trading engine started")
-        await self.alerter._send("🤖 <b>Trading bot started</b>")
+        await self.alerter.send_message("🤖 <b>Trading bot started</b>")
 
         # Start main loops
         await asyncio.gather(
@@ -94,10 +109,12 @@ class TradingEngine:
 
         logger.info("Shutting down... closing open positions")
         await self._force_close_all()
-        await self.alerter._send("🛑 <b>Trading bot stopped</b>")
 
-        if self.openalgo:
-            await self.openalgo.close()
+        if self.alerter:
+            await self.alerter.send_message("🛑 <b>Trading bot stopped</b>")
+
+        if self.broker:
+            await self.broker.close()
         if self.alerter:
             await self.alerter.close()
 
@@ -115,9 +132,9 @@ class TradingEngine:
     def update_dhan_token(self, token: str):
         """Update Dhan access token (called from postback endpoint)."""
         settings.dhan_access_token = token
-        if self.openalgo:
-            # OpenAlgo handles broker auth, but update settings for direct Dhan calls
-            logger.info("Dhan token updated in engine settings")
+        if self.broker and hasattr(self.broker, "refresh_token"):
+            self.broker.refresh_token(token)
+            logger.info("Dhan token updated in broker adapter")
 
     # --- Main Loops ---
 
@@ -126,7 +143,8 @@ class TradingEngine:
         while not self._shutdown:
             try:
                 if not self._is_scan_window():
-                    self.state = BotState.WAITING_MARKET if self.state != BotState.STOPPED else BotState.STOPPED
+                    if self.state not in (BotState.STOPPED, BotState.PAUSED):
+                        self.state = BotState.WAITING_MARKET
                     await asyncio.sleep(30)
                     continue
 
@@ -139,7 +157,8 @@ class TradingEngine:
 
             except Exception as e:
                 logger.error(f"Scan loop error: {e}", exc_info=True)
-                await self.alerter.notify_error(f"Scan loop error: {e}")
+                if self.alerter:
+                    await self.alerter.notify_error(f"Scan loop error: {e}")
 
             await asyncio.sleep(settings.scan_interval_seconds)
 
@@ -168,7 +187,7 @@ class TradingEngine:
             if now.hour == force_close_h and now.minute == force_close_m:
                 logger.info("Force close time reached")
                 await self._force_close_all()
-                await asyncio.sleep(60)  # Skip next check
+                await asyncio.sleep(60)
 
             # End-of-day analysis at 15:30
             if now.hour == market_close_h and now.minute == market_close_m:
@@ -222,12 +241,12 @@ class TradingEngine:
         stop_loss = self.risk_manager.calculate_stop_loss(signal.current_price)
         target = self.risk_manager.calculate_target(signal.current_price)
 
-        # Place order via OpenAlgo
+        # Place order
         if settings.paper_trading:
             order_id = f"PAPER-{datetime.now().strftime('%H%M%S')}"
             logger.info(f"PAPER TRADE: BUY {qty}x {signal.symbol} @ ₹{signal.current_price:.2f}")
         else:
-            order_resp = await self.openalgo.place_order(
+            order_resp = await self.broker.place_order(
                 symbol=signal.symbol,
                 action="BUY",
                 quantity=qty,
@@ -276,7 +295,7 @@ class TradingEngine:
 
     async def _check_open_positions(self):
         """Check all open positions against stop loss and target."""
-        from db.client import get_open_trades, update_trade
+        from db.client import get_open_trades
 
         open_trades = await get_open_trades()
         if not open_trades:
@@ -284,7 +303,7 @@ class TradingEngine:
 
         for trade in open_trades:
             symbol = trade["symbol"]
-            ltp = await self.openalgo.get_ltp(symbol)
+            ltp = await self.broker.get_ltp(symbol)
             if ltp is None:
                 continue
 
@@ -306,9 +325,9 @@ class TradingEngine:
 
         status = TradeStatus.STOPPED_OUT if reason == "STOP_LOSS" else TradeStatus.CLOSED
 
-        # Close position via OpenAlgo (if not paper)
+        # Close position (if not paper)
         if not settings.paper_trading:
-            await self.openalgo.close_position(trade["symbol"])
+            await self.broker.close_position(trade["symbol"])
 
         # Update trade in DB
         await update_trade(trade["id"], {
@@ -356,7 +375,7 @@ class TradingEngine:
 
         open_trades = await get_open_trades()
         for trade in open_trades:
-            ltp = await self.openalgo.get_ltp(trade["symbol"])
+            ltp = await self.broker.get_ltp(trade["symbol"])
             if ltp:
                 await self._exit_trade(trade, ltp, "FORCE_CLOSE")
 
@@ -388,7 +407,7 @@ class TradingEngine:
         await upsert_daily_performance(perf)
 
         # Run learning analysis
-        analysis = await self.learning.analyze_day()
+        await self.learning.analyze_day()
 
         # Send summary
         await self.alerter.notify_daily_summary(perf)
