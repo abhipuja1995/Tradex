@@ -172,30 +172,54 @@ class DhanBroker:
         if not security_id or not self._initialized:
             return None
 
+        # Primary: use quote_data for real-time LTP
         try:
-            resp = self._dhan.get_market_feed(
-                security_id=str(security_id),
-                exchange_segment=self._dhan.NSE,
-            )
+            # quote_data expects instrument_id as key in dict: {exchange_segment: [security_ids]}
+            resp = self._dhan.quote_data({self._dhan.NSE: [str(security_id)]})
             if resp and resp.get("data"):
-                return float(resp["data"].get("LTP", 0))
+                data = resp["data"]
+                # Response format: {security_id: {LTP: ..., ...}}
+                quote = data.get(str(security_id), {})
+                ltp = quote.get("LTP") or quote.get("ltp") or quote.get("last_price")
+                if ltp:
+                    return float(ltp)
         except Exception as e:
-            logger.error(f"Dhan LTP failed for {symbol}: {e}")
+            logger.debug(f"Dhan quote_data failed for {symbol}: {e}")
 
-        # Fallback: try intraday candle data for last close
+        # Fallback: use ohlc_data
         try:
-            resp = self._dhan.intraday_daily_candle_data(
+            resp = self._dhan.ohlc_data({self._dhan.NSE: [str(security_id)]})
+            if resp and resp.get("data"):
+                data = resp["data"]
+                ohlc = data.get(str(security_id), {})
+                close = ohlc.get("close") or ohlc.get("Close")
+                if close:
+                    return float(close)
+        except Exception as e:
+            logger.debug(f"Dhan ohlc_data failed for {symbol}: {e}")
+
+        # Last resort: use intraday minute data for latest close
+        try:
+            from datetime import datetime, timedelta
+            to_date = datetime.now().strftime("%Y-%m-%d")
+            from_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+            resp = self._dhan.intraday_minute_data(
                 security_id=str(security_id),
                 exchange_segment=self._dhan.NSE,
-                instrument_type=self._dhan.EQUITY,
+                instrument_type=self._dhan.INDEX if symbol.startswith("NIFTY") else "EQUITY",
             )
             if resp and resp.get("data"):
                 candles = resp["data"]
-                if candles:
-                    last = candles[-1] if isinstance(candles, list) else candles
+                if isinstance(candles, list) and candles:
+                    last = candles[-1]
                     return float(last.get("close", last.get("Close", 0)))
+                elif isinstance(candles, dict):
+                    closes = candles.get("close", candles.get("Close", []))
+                    if closes:
+                        return float(closes[-1])
         except Exception as e:
-            logger.error(f"Dhan candle fallback failed for {symbol}: {e}")
+            logger.error(f"Dhan intraday_minute_data failed for {symbol}: {e}")
 
         return None
 

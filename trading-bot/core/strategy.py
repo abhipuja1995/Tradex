@@ -233,11 +233,27 @@ class HybridStrategy:
         try:
             from dhanhq import dhanhq
             dhan = dhanhq(settings.dhan_client_id, settings.dhan_access_token)
+            from datetime import datetime, timedelta
 
-            response = dhan.intraday_daily_candle_data(
+            # Use intraday_minute_data for recent candles
+            response = dhan.intraday_minute_data(
                 security_id=str(security_id),
                 exchange_segment=dhan.NSE,
-                instrument_type=dhan.EQUITY,
+                instrument_type="EQUITY",
+            )
+
+            if response and response.get("data"):
+                return candles_from_dhan_data(response["data"])
+
+            # Fallback: historical daily data for longer term
+            to_date = datetime.now().strftime("%Y-%m-%d")
+            from_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            response = dhan.historical_daily_data(
+                security_id=str(security_id),
+                exchange_segment=dhan.NSE,
+                instrument_type="EQUITY",
+                from_date=from_date,
+                to_date=to_date,
             )
 
             if response and response.get("data"):

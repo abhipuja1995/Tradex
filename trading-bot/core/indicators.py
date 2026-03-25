@@ -56,14 +56,30 @@ def is_near_support(price: float, support: float, tolerance_pct: float = 2.0) ->
     return price <= support * (1 + tolerance_pct / 100)
 
 
-def candles_from_dhan_data(ohlcv_data: list[dict]) -> pd.DataFrame:
+def candles_from_dhan_data(ohlcv_data) -> pd.DataFrame:
     """Convert Dhan API OHLCV response to pandas DataFrame.
 
-    Dhan returns: [{open, high, low, close, volume, start_Time}, ...]
+    Dhan SDK v2 can return data in two formats:
+    1. List of dicts: [{open, high, low, close, volume, start_Time}, ...]
+    2. Dict of lists: {open: [...], high: [...], low: [...], close: [...], volume: [...]}
     """
-    df = pd.DataFrame(ohlcv_data)
+    if isinstance(ohlcv_data, list):
+        df = pd.DataFrame(ohlcv_data)
+    elif isinstance(ohlcv_data, dict):
+        df = pd.DataFrame(ohlcv_data)
+    else:
+        return pd.DataFrame()
+
+    # Normalize column names to lowercase
     df.columns = [c.lower().replace("start_time", "timestamp") for c in df.columns]
+
     for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0).astype(int)
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype(int)
+    else:
+        df["volume"] = 0
+
     return df
