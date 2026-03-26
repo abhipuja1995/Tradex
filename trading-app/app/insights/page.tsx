@@ -2,57 +2,58 @@
 
 import { useEffect, useState, useCallback } from "react";
 
-// ── Types ──────────────────────────────────────────────────────────────────
+// ── Types (aligned with actual API responses) ───────────────────────────────
 
 type MacroSignal = {
   name: string;
   value: number;
-  change: number;
-  direction: "bullish" | "bearish" | "neutral";
+  signal: "BULLISH" | "BEARISH" | "NEUTRAL";
   description: string;
 };
 
 type MacroData = {
-  regime: "RISK ON" | "RISK OFF" | "TRANSITION";
+  regime: "RISK_ON" | "RISK_OFF" | "TRANSITION";
   signals: MacroSignal[];
 };
 
 type IndexData = {
+  symbol: string;
   name: string;
   price: number;
-  change_pct: number;
-  dma_50: number;
-  dma_100: number;
-  dma_200: number;
+  change: number;
+  changePercent: number;
+  dma50: number | null;
+  dma100: number | null;
+  dma200: number | null;
+  trend: string | null;
+  rsi: number | null;
 };
 
 type BreadthData = {
-  above_200dma_pct: number;
+  dma200: { above: number; total: number; percent: number };
+  dma50: { above: number; total: number; percent: number };
+  health: "STRONG" | "MODERATE" | "WEAK";
 };
 
 type VolatilityData = {
-  india_vix: number;
-  us_vix: number;
+  indiaVix: { price: number; level: string; signal: string; description: string } | null;
+  usVix: { price: number; level: string; signal: string; description: string } | null;
 };
 
 type CommodityItem = {
+  symbol: string;
   name: string;
   price: number;
-  change_pct: number;
-  signal: string;
-  extra?: string;
+  changePercent: number;
+  trend: string | null;
+  rsi: number | null;
 };
 
 type CryptoItem = {
   symbol: string;
+  name: string;
   price: number;
-  change_24h: number;
-  signal: string;
-};
-
-type CryptoData = {
-  coins: CryptoItem[];
-  allocation_signal: string;
+  changePercent: number;
 };
 
 // ── Tabs ───────────────────────────────────────────────────────────────────
@@ -115,10 +116,15 @@ function arrow(v: number) {
   return v > 0 ? "↑" : v < 0 ? "↓" : "–";
 }
 
-function directionColor(d: string) {
-  if (d === "bullish") return "var(--success)";
-  if (d === "bearish") return "var(--danger)";
+function signalColor(d: string) {
+  const lower = d.toLowerCase();
+  if (lower === "bullish") return "var(--success)";
+  if (lower === "bearish") return "var(--danger)";
   return "var(--text-secondary)";
+}
+
+function regimeLabel(regime: string): string {
+  return regime.replace(/_/g, " ");
 }
 
 function vixLevel(v: number): { label: string; color: string; bg: string } {
@@ -151,7 +157,7 @@ export default function InsightsPage() {
   const [breadth, setBreadth] = useState<BreadthData | null>(null);
   const [vol, setVol] = useState<VolatilityData | null>(null);
   const [commodities, setCommodities] = useState<CommodityItem[]>([]);
-  const [crypto, setCrypto] = useState<CryptoData | null>(null);
+  const [crypto, setCrypto] = useState<CryptoItem[]>([]);
 
   // loading flags per panel
   const [loadingMacro, setLoadingMacro] = useState(true);
@@ -202,7 +208,7 @@ export default function InsightsPage() {
     setLoadingCrypto(true);
     fetch("/api/market/crypto")
       .then((r) => r.json())
-      .then((d) => setCrypto(d))
+      .then((d) => setCrypto(d.crypto || []))
       .catch(() => {})
       .finally(() => setLoadingCrypto(false));
   }, []);
@@ -267,7 +273,7 @@ export default function InsightsPage() {
       {activeTab === "commodities" && (
         <CommoditiesPanel items={commodities} loading={loadingComm} />
       )}
-      {activeTab === "crypto" && <CryptoPanel data={crypto} loading={loadingCrypto} />}
+      {activeTab === "crypto" && <CryptoPanel items={crypto} loading={loadingCrypto} />}
     </div>
   );
 }
@@ -296,12 +302,13 @@ function MacroPanel({ data, loading }: { data: MacroData | null; loading: boolea
   if (loading) return <LoadingPlaceholder />;
   if (!data) return <EmptyState label="No macro data available" />;
 
+  const displayRegime = regimeLabel(data.regime);
   const regimeColors: Record<string, { bg: string; text: string }> = {
     "RISK ON": { bg: "rgba(34,197,94,0.18)", text: "#22c55e" },
     "RISK OFF": { bg: "rgba(239,68,68,0.18)", text: "#ef4444" },
     TRANSITION: { bg: "rgba(234,179,8,0.18)", text: "#eab308" },
   };
-  const rc = regimeColors[data.regime] || regimeColors.TRANSITION;
+  const rc = regimeColors[displayRegime] || regimeColors.TRANSITION;
 
   return (
     <div>
@@ -328,58 +335,51 @@ function MacroPanel({ data, loading }: { data: MacroData | null; loading: boolea
             letterSpacing: "0.06em",
           }}
         >
-          {data.regime}
+          {displayRegime}
         </span>
       </div>
 
       {/* Signal Cards */}
       <div style={cardGrid3}>
-        {data.signals.map((s) => (
-          <div
-            key={s.name}
-            className="glass-panel"
-            style={{ padding: "1rem 1.25rem" }}
-          >
-            <div style={labelStyle}>{s.name}</div>
-            <div style={{ display: "flex", alignItems: "baseline", gap: "0.5rem" }}>
-              <span style={bigNum}>{s.value.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
-              <span
+        {data.signals.map((s) => {
+          const dir = s.signal.toLowerCase();
+          return (
+            <div
+              key={s.name}
+              className="glass-panel"
+              style={{ padding: "1rem 1.25rem" }}
+            >
+              <div style={labelStyle}>{s.name}</div>
+              <div style={{ display: "flex", alignItems: "baseline", gap: "0.5rem" }}>
+                <span style={bigNum}>{s.value.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
+              </div>
+              <div
                 style={{
-                  color: directionColor(s.direction),
-                  fontWeight: 600,
-                  fontSize: "0.95rem",
+                  marginTop: "0.4rem",
+                  fontSize: "0.75rem",
+                  color: "var(--text-secondary)",
                 }}
               >
-                {arrow(s.change)} {s.change > 0 ? "+" : ""}
-                {s.change.toFixed(2)}%
+                {s.description}
+              </div>
+              <span
+                style={{
+                  ...smallBadge(
+                    dir === "bullish"
+                      ? "rgba(34,197,94,0.12)"
+                      : dir === "bearish"
+                      ? "rgba(239,68,68,0.12)"
+                      : "rgba(148,163,184,0.12)",
+                    signalColor(s.signal)
+                  ),
+                  marginTop: "0.5rem",
+                }}
+              >
+                {s.signal}
               </span>
             </div>
-            <div
-              style={{
-                marginTop: "0.4rem",
-                fontSize: "0.75rem",
-                color: "var(--text-secondary)",
-              }}
-            >
-              {s.description}
-            </div>
-            <span
-              style={{
-                ...smallBadge(
-                  s.direction === "bullish"
-                    ? "rgba(34,197,94,0.12)"
-                    : s.direction === "bearish"
-                    ? "rgba(239,68,68,0.12)"
-                    : "rgba(148,163,184,0.12)",
-                  directionColor(s.direction)
-                ),
-                marginTop: "0.5rem",
-              }}
-            >
-              {s.direction.toUpperCase()}
-            </span>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -404,91 +404,130 @@ function HealthPanel({
       <div style={{ ...cardGrid4, marginBottom: "1.25rem" }}>
         {indices.length === 0 && <EmptyState label="No index data" />}
         {indices.map((idx) => {
-          const aboveDma = (dma: number) => idx.price >= dma;
+          const dma50 = idx.dma50 ?? 0;
+          const dma100 = idx.dma100 ?? 0;
+          const dma200 = idx.dma200 ?? 0;
+          const aboveDma = (dma: number) => dma > 0 && idx.price >= dma;
           return (
-            <div key={idx.name} className="glass-panel" style={{ padding: "1rem 1.25rem" }}>
+            <div key={idx.symbol} className="glass-panel" style={{ padding: "1rem 1.25rem" }}>
               <div style={labelStyle}>{idx.name}</div>
               <div style={{ ...bigNum, marginBottom: "0.25rem" }}>
                 {idx.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}
               </div>
-              <span style={{ color: changeColor(idx.change_pct), fontWeight: 600, fontSize: "0.85rem" }}>
-                {arrow(idx.change_pct)} {idx.change_pct > 0 ? "+" : ""}
-                {idx.change_pct.toFixed(2)}%
+              <span style={{ color: changeColor(idx.changePercent), fontWeight: 600, fontSize: "0.85rem" }}>
+                {arrow(idx.changePercent)} {idx.changePercent > 0 ? "+" : ""}
+                {idx.changePercent.toFixed(2)}%
               </span>
 
               {/* DMA levels */}
-              <div style={{ marginTop: "0.75rem", display: "flex", flexDirection: "column", gap: "0.3rem" }}>
-                {[
-                  { label: "50 DMA", val: idx.dma_50 },
-                  { label: "100 DMA", val: idx.dma_100 },
-                  { label: "200 DMA", val: idx.dma_200 },
-                ].map((d) => (
-                  <div
-                    key={d.label}
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      fontSize: "0.72rem",
-                    }}
-                  >
-                    <span style={{ color: "var(--text-secondary)" }}>{d.label}</span>
-                    <span style={{ color: aboveDma(d.val) ? "var(--success)" : "var(--danger)", fontWeight: 600 }}>
-                      {d.val.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+              {(dma50 > 0 || dma100 > 0 || dma200 > 0) && (
+                <div style={{ marginTop: "0.75rem", display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+                  {[
+                    { label: "50 DMA", val: dma50 },
+                    { label: "100 DMA", val: dma100 },
+                    { label: "200 DMA", val: dma200 },
+                  ].filter(d => d.val > 0).map((d) => (
+                    <div
+                      key={d.label}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        fontSize: "0.72rem",
+                      }}
+                    >
+                      <span style={{ color: "var(--text-secondary)" }}>{d.label}</span>
+                      <span style={{ color: aboveDma(d.val) ? "var(--success)" : "var(--danger)", fontWeight: 600 }}>
+                        {d.val.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Trend & RSI */}
+              {(idx.trend || idx.rsi != null) && (
+                <div style={{ marginTop: "0.5rem", display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                  {idx.trend && (
+                    <span style={smallBadge(
+                      idx.trend.includes("BULL") ? "rgba(34,197,94,0.12)" : idx.trend.includes("BEAR") ? "rgba(239,68,68,0.12)" : "rgba(148,163,184,0.12)",
+                      idx.trend.includes("BULL") ? "#22c55e" : idx.trend.includes("BEAR") ? "#ef4444" : "#94a3b8"
+                    )}>
+                      {idx.trend}
                     </span>
-                  </div>
-                ))}
-              </div>
+                  )}
+                  {idx.rsi != null && (
+                    <span style={{
+                      fontSize: "0.7rem",
+                      color: idx.rsi > 70 ? "var(--danger)" : idx.rsi < 30 ? "var(--success)" : "var(--text-secondary)",
+                      fontWeight: 600,
+                    }}>
+                      RSI {idx.rsi.toFixed(1)}
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
           );
         })}
       </div>
 
       {/* Breadth Meter */}
-      {breadth && (
+      {breadth && breadth.dma200 && (
         <div className="glass-panel" style={{ padding: "1.25rem" }}>
-          <div style={labelStyle}>Market Breadth</div>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "1rem",
-              marginTop: "0.5rem",
-            }}
-          >
-            {/* Bar */}
-            <div
-              style={{
-                flex: 1,
-                height: "12px",
-                background: "rgba(255,255,255,0.06)",
+          <div style={labelStyle}>Market Breadth — Nifty 50</div>
+
+          {/* 200 DMA breadth */}
+          <div style={{ marginTop: "0.5rem", marginBottom: "1rem" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "0.3rem" }}>
+              <span style={{ fontSize: "0.78rem", color: "var(--text-secondary)" }}>
+                Above 200 DMA ({breadth.dma200.above}/{breadth.dma200.total})
+              </span>
+              <span style={{ fontSize: "1.1rem", fontWeight: 700, color: breadthColor(breadth.dma200.percent) }}>
+                {breadth.dma200.percent.toFixed(1)}%
+              </span>
+            </div>
+            <div style={{ height: "12px", background: "rgba(255,255,255,0.06)", borderRadius: "6px", overflow: "hidden" }}>
+              <div style={{
+                width: `${breadth.dma200.percent}%`,
+                height: "100%",
+                background: breadthColor(breadth.dma200.percent),
                 borderRadius: "6px",
-                overflow: "hidden",
-              }}
-            >
-              <div
-                style={{
-                  width: `${breadth.above_200dma_pct}%`,
+                transition: "width 0.4s",
+              }} />
+            </div>
+          </div>
+
+          {/* 50 DMA breadth */}
+          {breadth.dma50 && (
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "0.3rem" }}>
+                <span style={{ fontSize: "0.78rem", color: "var(--text-secondary)" }}>
+                  Above 50 DMA ({breadth.dma50.above}/{breadth.dma50.total})
+                </span>
+                <span style={{ fontSize: "1.1rem", fontWeight: 700, color: breadthColor(breadth.dma50.percent) }}>
+                  {breadth.dma50.percent.toFixed(1)}%
+                </span>
+              </div>
+              <div style={{ height: "12px", background: "rgba(255,255,255,0.06)", borderRadius: "6px", overflow: "hidden" }}>
+                <div style={{
+                  width: `${breadth.dma50.percent}%`,
                   height: "100%",
-                  background: breadthColor(breadth.above_200dma_pct),
+                  background: breadthColor(breadth.dma50.percent),
                   borderRadius: "6px",
                   transition: "width 0.4s",
-                }}
-              />
+                }} />
+              </div>
             </div>
-            <span
-              style={{
-                fontSize: "1.2rem",
-                fontWeight: 700,
-                color: breadthColor(breadth.above_200dma_pct),
-                minWidth: "60px",
-                textAlign: "right",
-              }}
-            >
-              {breadth.above_200dma_pct.toFixed(1)}%
+          )}
+
+          {/* Health badge */}
+          <div style={{ marginTop: "0.75rem" }}>
+            <span style={smallBadge(
+              breadth.health === "STRONG" ? "rgba(34,197,94,0.15)" : breadth.health === "WEAK" ? "rgba(239,68,68,0.15)" : "rgba(234,179,8,0.15)",
+              breadth.health === "STRONG" ? "#22c55e" : breadth.health === "WEAK" ? "#ef4444" : "#eab308"
+            )}>
+              {breadth.health}
             </span>
-          </div>
-          <div style={{ fontSize: "0.75rem", color: "var(--text-secondary)", marginTop: "0.35rem" }}>
-            Stocks above 200 DMA
           </div>
         </div>
       )}
@@ -502,28 +541,49 @@ function VolatilityPanel({ data, loading }: { data: VolatilityData | null; loadi
   if (loading) return <LoadingPlaceholder />;
   if (!data) return <EmptyState label="No volatility data available" />;
 
-  const iv = vixLevel(data.india_vix);
-  const uv = vixLevel(data.us_vix);
-  const optSig = optionsSignal(Math.max(data.india_vix, data.us_vix));
+  const indiaVixPrice = data.indiaVix?.price ?? 0;
+  const usVixPrice = data.usVix?.price ?? 0;
+  const iv = vixLevel(indiaVixPrice);
+  const uv = vixLevel(usVixPrice);
+  const maxVix = Math.max(indiaVixPrice, usVixPrice);
+  const optSig = optionsSignal(maxVix > 0 ? maxVix : 20);
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem" }}>
       {/* India VIX */}
       <div className="glass-panel" style={{ padding: "1.25rem" }}>
         <div style={labelStyle}>India VIX</div>
-        <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", marginBottom: "0.5rem" }}>
-          <span style={bigNum}>{data.india_vix.toFixed(2)}</span>
-          <span style={smallBadge(iv.bg, iv.color)}>{iv.label}</span>
-        </div>
+        {data.indiaVix ? (
+          <>
+            <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", marginBottom: "0.5rem" }}>
+              <span style={bigNum}>{indiaVixPrice.toFixed(2)}</span>
+              <span style={smallBadge(iv.bg, iv.color)}>{iv.label}</span>
+            </div>
+            <div style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>
+              {data.indiaVix.description}
+            </div>
+          </>
+        ) : (
+          <div style={{ color: "var(--text-secondary)", fontSize: "0.85rem" }}>Data unavailable</div>
+        )}
       </div>
 
       {/* US VIX */}
       <div className="glass-panel" style={{ padding: "1.25rem" }}>
         <div style={labelStyle}>US VIX (CBOE)</div>
-        <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", marginBottom: "0.5rem" }}>
-          <span style={bigNum}>{data.us_vix.toFixed(2)}</span>
-          <span style={smallBadge(uv.bg, uv.color)}>{uv.label}</span>
-        </div>
+        {data.usVix ? (
+          <>
+            <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", marginBottom: "0.5rem" }}>
+              <span style={bigNum}>{usVixPrice.toFixed(2)}</span>
+              <span style={smallBadge(uv.bg, uv.color)}>{uv.label}</span>
+            </div>
+            <div style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>
+              {data.usVix.description}
+            </div>
+          </>
+        ) : (
+          <div style={{ color: "var(--text-secondary)", fontSize: "0.85rem" }}>Data unavailable</div>
+        )}
       </div>
 
       {/* Options Signal - full width */}
@@ -546,21 +606,28 @@ function CommoditiesPanel({ items, loading }: { items: CommodityItem[]; loading:
   return (
     <div style={cardGrid3}>
       {items.map((c) => (
-        <div key={c.name} className="glass-panel" style={{ padding: "1.25rem" }}>
+        <div key={c.symbol} className="glass-panel" style={{ padding: "1.25rem" }}>
           <div style={labelStyle}>{c.name}</div>
           <div style={{ ...bigNum, marginBottom: "0.25rem" }}>
             ${c.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}
           </div>
-          <span style={{ color: changeColor(c.change_pct), fontWeight: 600, fontSize: "0.85rem" }}>
-            {arrow(c.change_pct)} {c.change_pct > 0 ? "+" : ""}
-            {c.change_pct.toFixed(2)}%
+          <span style={{ color: changeColor(c.changePercent), fontWeight: 600, fontSize: "0.85rem" }}>
+            {arrow(c.changePercent)} {c.changePercent > 0 ? "+" : ""}
+            {c.changePercent.toFixed(2)}%
           </span>
-          <div style={{ marginTop: "0.6rem", fontSize: "0.78rem", color: "var(--text-secondary)" }}>
-            {c.signal}
-          </div>
-          {c.extra && (
-            <div style={{ fontSize: "0.72rem", color: "var(--text-secondary)", marginTop: "0.2rem" }}>
-              {c.extra}
+          {c.trend && (
+            <div style={{ marginTop: "0.5rem" }}>
+              <span style={smallBadge(
+                c.trend.includes("BULL") ? "rgba(34,197,94,0.12)" : c.trend.includes("BEAR") ? "rgba(239,68,68,0.12)" : "rgba(148,163,184,0.12)",
+                c.trend.includes("BULL") ? "#22c55e" : c.trend.includes("BEAR") ? "#ef4444" : "#94a3b8"
+              )}>
+                {c.trend}
+              </span>
+            </div>
+          )}
+          {c.rsi != null && (
+            <div style={{ marginTop: "0.3rem", fontSize: "0.72rem", color: "var(--text-secondary)" }}>
+              RSI: {c.rsi.toFixed(1)}
             </div>
           )}
         </div>
@@ -571,26 +638,31 @@ function CommoditiesPanel({ items, loading }: { items: CommodityItem[]; loading:
 
 // ── Crypto Panel ───────────────────────────────────────────────────────────
 
-function CryptoPanel({ data, loading }: { data: CryptoData | null; loading: boolean }) {
+function CryptoPanel({ items, loading }: { items: CryptoItem[]; loading: boolean }) {
   if (loading) return <LoadingPlaceholder />;
-  if (!data) return <EmptyState label="No crypto data available" />;
+  if (items.length === 0) return <EmptyState label="No crypto data available" />;
+
+  // Determine allocation signal based on aggregate performance
+  const avgChange = items.reduce((sum, c) => sum + c.changePercent, 0) / (items.length || 1);
+  const allocSignal = avgChange > 2
+    ? "Increase crypto allocation - momentum positive"
+    : avgChange < -2
+    ? "Reduce crypto exposure - momentum negative"
+    : "Hold current allocation - sideways market";
 
   return (
     <div>
       <div style={cardGrid3}>
-        {data.coins.map((c) => (
+        {items.map((c) => (
           <div key={c.symbol} className="glass-panel" style={{ padding: "1.25rem" }}>
-            <div style={labelStyle}>{c.symbol}</div>
+            <div style={labelStyle}>{c.name || c.symbol}</div>
             <div style={{ ...bigNum, marginBottom: "0.25rem" }}>
               ${c.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}
             </div>
-            <span style={{ color: changeColor(c.change_24h), fontWeight: 600, fontSize: "0.85rem" }}>
-              {arrow(c.change_24h)} {c.change_24h > 0 ? "+" : ""}
-              {c.change_24h.toFixed(2)}%
+            <span style={{ color: changeColor(c.changePercent), fontWeight: 600, fontSize: "0.85rem" }}>
+              {arrow(c.changePercent)} {c.changePercent > 0 ? "+" : ""}
+              {c.changePercent.toFixed(2)}%
             </span>
-            <div style={{ marginTop: "0.5rem", fontSize: "0.78rem", color: "var(--text-secondary)" }}>
-              {c.signal}
-            </div>
           </div>
         ))}
       </div>
@@ -602,15 +674,15 @@ function CryptoPanel({ data, loading }: { data: CryptoData | null; loading: bool
           style={{
             fontSize: "1.05rem",
             fontWeight: 600,
-            color: data.allocation_signal.toLowerCase().includes("increase")
+            color: allocSignal.includes("Increase")
               ? "var(--success)"
-              : data.allocation_signal.toLowerCase().includes("reduce")
+              : allocSignal.includes("Reduce")
               ? "var(--danger)"
               : "var(--accent)",
             marginTop: "0.25rem",
           }}
         >
-          {data.allocation_signal}
+          {allocSignal}
         </div>
       </div>
     </div>

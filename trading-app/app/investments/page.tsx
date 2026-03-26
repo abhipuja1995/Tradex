@@ -6,10 +6,11 @@ import { useEffect, useState, useCallback } from "react";
 
 type StockPick = {
   symbol: string;
+  name: string;
   price: number;
-  change_pct: number;
-  rsi: number;
-  dma_trend: "ABOVE" | "BELOW" | "NEUTRAL";
+  changePercent: number;
+  rsi: number | null;
+  trend: string | null;
   signal: "BUY" | "HOLD" | "SELL";
 };
 
@@ -32,7 +33,7 @@ const BUCKETS: BucketConfig[] = [
     label: "Weeks",
     strategy: "Momentum + Options Hedge",
     targetIRR: "20-30%",
-    maxDrawdown: "<10%",
+    maxDrawdown: "<5%",
     maxCapPerTrade: "5%",
     optionsAllocation: "2%",
     cryptoCap: "10%",
@@ -42,7 +43,7 @@ const BUCKETS: BucketConfig[] = [
     label: "3 Months",
     strategy: "Swing Breakout + Sector Rotation",
     targetIRR: "25-35%",
-    maxDrawdown: "<10%",
+    maxDrawdown: "<5%",
     maxCapPerTrade: "5%",
     optionsAllocation: "2%",
     cryptoCap: "12%",
@@ -52,7 +53,7 @@ const BUCKETS: BucketConfig[] = [
     label: "6 Months",
     strategy: "Trend Following + Value Accumulation",
     targetIRR: "18-28%",
-    maxDrawdown: "<12%",
+    maxDrawdown: "<6%",
     maxCapPerTrade: "5%",
     optionsAllocation: "2%",
     cryptoCap: "12%",
@@ -62,7 +63,7 @@ const BUCKETS: BucketConfig[] = [
     label: "9 Months",
     strategy: "Multi-Factor + Dividend Capture",
     targetIRR: "22-30%",
-    maxDrawdown: "<12%",
+    maxDrawdown: "<7%",
     maxCapPerTrade: "5%",
     optionsAllocation: "2%",
     cryptoCap: "15%",
@@ -72,7 +73,7 @@ const BUCKETS: BucketConfig[] = [
     label: "12 Months",
     strategy: "Core Satellite + Macro Overlay",
     targetIRR: "25-40%",
-    maxDrawdown: "<12%",
+    maxDrawdown: "<7%",
     maxCapPerTrade: "5%",
     optionsAllocation: "2%",
     cryptoCap: "15%",
@@ -129,6 +130,34 @@ function signalBadge(signal: string): { bg: string; color: string } {
   return { bg: "rgba(234,179,8,0.12)", color: "#eab308" };
 }
 
+function deriveSignal(trend: string | null, rsi: number | null): "BUY" | "HOLD" | "SELL" {
+  if (!trend && rsi == null) return "HOLD";
+  const isBullTrend = trend?.includes("BULL");
+  const isBearTrend = trend?.includes("BEAR");
+  const isOversold = rsi != null && rsi < 35;
+  const isOverbought = rsi != null && rsi > 70;
+
+  if (isBullTrend && !isOverbought) return "BUY";
+  if (isOversold && !isBearTrend) return "BUY";
+  if (isBearTrend && isOverbought) return "SELL";
+  if (isBearTrend) return "SELL";
+  return "HOLD";
+}
+
+function trendLabel(trend: string | null): string {
+  if (!trend) return "–";
+  if (trend.includes("BULL")) return "ABOVE";
+  if (trend.includes("BEAR")) return "BELOW";
+  return "NEUTRAL";
+}
+
+function trendColor(trend: string | null): string {
+  if (!trend) return "var(--text-secondary)";
+  if (trend.includes("BULL")) return "var(--success)";
+  if (trend.includes("BEAR")) return "var(--danger)";
+  return "var(--text-secondary)";
+}
+
 // ── Main Component ─────────────────────────────────────────────────────────
 
 export default function InvestmentsPage() {
@@ -144,15 +173,21 @@ export default function InvestmentsPage() {
     try {
       const res = await fetch("/api/market/indices");
       const data = await res.json();
-      // Map index movers to stock pick format
-      const picks: StockPick[] = (data.movers || []).map((m: Record<string, unknown>) => ({
-        symbol: m.symbol as string,
-        price: (m.price as number) || 0,
-        change_pct: (m.change_pct as number) || 0,
-        rsi: (m.rsi as number) || 50,
-        dma_trend: ((m.dma_trend as string) || "NEUTRAL") as "ABOVE" | "BELOW" | "NEUTRAL",
-        signal: ((m.signal as string) || "HOLD") as "BUY" | "HOLD" | "SELL",
-      }));
+      // Map indices data (QuoteData + technicals) to stock pick format
+      const indexItems = data.indices || [];
+      const picks: StockPick[] = indexItems.map((item: Record<string, unknown>) => {
+        const trend = (item.trend as string) || null;
+        const rsi = item.rsi != null ? (item.rsi as number) : null;
+        return {
+          symbol: (item.symbol as string) || "",
+          name: (item.name as string) || (item.symbol as string) || "",
+          price: (item.price as number) || 0,
+          changePercent: (item.changePercent as number) || 0,
+          rsi,
+          trend,
+          signal: deriveSignal(trend, rsi),
+        };
+      });
       setStocks(picks);
     } catch {
       setStocks([]);
@@ -308,42 +343,36 @@ export default function InvestmentsPage() {
                     const sig = signalBadge(s.signal);
                     return (
                       <tr key={s.symbol} style={{ borderBottom: "1px solid rgba(255,255,255,0.03)" }}>
-                        <td style={{ ...tdStyle, fontWeight: 600 }}>{s.symbol}</td>
+                        <td style={{ ...tdStyle, fontWeight: 600 }}>{s.name || s.symbol}</td>
                         <td style={tdStyle}>
-                          {"\u20B9"}
                           {s.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                         </td>
-                        <td style={{ ...tdStyle, color: changeColor(s.change_pct), fontWeight: 600 }}>
-                          {arrow(s.change_pct)} {s.change_pct > 0 ? "+" : ""}
-                          {s.change_pct.toFixed(2)}%
+                        <td style={{ ...tdStyle, color: changeColor(s.changePercent), fontWeight: 600 }}>
+                          {arrow(s.changePercent)} {s.changePercent > 0 ? "+" : ""}
+                          {s.changePercent.toFixed(2)}%
                         </td>
                         <td
                           style={{
                             ...tdStyle,
                             color:
-                              s.rsi > 70
+                              s.rsi != null && s.rsi > 70
                                 ? "var(--danger)"
-                                : s.rsi < 30
+                                : s.rsi != null && s.rsi < 30
                                 ? "var(--success)"
                                 : "var(--text-primary)",
                           }}
                         >
-                          {s.rsi.toFixed(1)}
+                          {s.rsi != null ? s.rsi.toFixed(1) : "–"}
                         </td>
                         <td style={tdStyle}>
                           <span
                             style={{
-                              color:
-                                s.dma_trend === "ABOVE"
-                                  ? "var(--success)"
-                                  : s.dma_trend === "BELOW"
-                                  ? "var(--danger)"
-                                  : "var(--text-secondary)",
+                              color: trendColor(s.trend),
                               fontWeight: 600,
                               fontSize: "0.75rem",
                             }}
                           >
-                            {s.dma_trend}
+                            {trendLabel(s.trend)}
                           </span>
                         </td>
                         <td style={tdStyle}>
@@ -421,7 +450,7 @@ export default function InvestmentsPage() {
               </span>
             </h2>
             <p style={{ color: "var(--text-secondary)", fontSize: "0.8rem", marginBottom: "0.75rem" }}>
-              If drawdown exceeds 15%, all trading will stop automatically.
+              If portfolio drawdown exceeds 10%, all trading will stop automatically.
             </p>
             <button
               className="btn"
