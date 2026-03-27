@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "8692730838:AAHrThgIgUYaG1FjBZqClLkbgSIvUxKi7O4";
-const HARDCODED_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+const HARDCODED_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "6747798646";
 
 async function sendTelegram(chatId: string, text: string): Promise<{ ok: boolean; error?: string }> {
   try {
