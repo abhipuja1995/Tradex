@@ -140,11 +140,18 @@ class TradingEngine:
 
     async def _scan_loop(self):
         """Main scanning loop — runs every scan_interval during market hours."""
+        _last_waiting_log = None
         while not self._shutdown:
             try:
                 if not self._is_scan_window():
                     if self.state not in (BotState.STOPPED, BotState.PAUSED):
                         self.state = BotState.WAITING_MARKET
+                        # Log "waiting for market" once per hour
+                        now = datetime.now(IST)
+                        hour_key = now.strftime("%Y-%m-%d-%H")
+                        if _last_waiting_log != hour_key:
+                            logger.info(f"Outside scan window ({settings.market_open}-{settings.scan_stop} IST), waiting...")
+                            _last_waiting_log = hour_key
                     await asyncio.sleep(30)
                     continue
 
@@ -220,10 +227,13 @@ class TradingEngine:
             return
 
         # Scan for signals
+        logger.info(f"Starting scan cycle (trades today: {len(trades_today)}, remaining cap: ₹{wallet_state.remaining_daily_cap:.0f})")
         signals = await self.strategy.scan()
         if not signals:
+            logger.info("No trade signals found this cycle")
             return
 
+        logger.info(f"Found {len(signals)} signal(s), executing top signal")
         # Execute top signal (one trade per scan cycle)
         signal = signals[0]
         await self._execute_trade(signal)

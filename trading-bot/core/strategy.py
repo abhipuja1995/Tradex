@@ -1,10 +1,10 @@
-"""Hybrid strategy combining TradingAgents AI signals with RSI technical analysis.
+"""Hybrid strategy combining AI signals with multi-indicator technical analysis.
 
-Architecture:
-- Dhan SDK: execution layer (orders, positions, funds)
-- OpenAlgo: strategy & automation signals (optional enhancement)
-- TradingAgents: multi-agent AI signal generation
-- RSI + Support: technical confirmation layer
+Paper trading strategy uses relaxed entry conditions:
+- RSI oversold bounce (RSI < 40)
+- DMA crossover (price crosses above 20 EMA)
+- Momentum plays (RSI 40-60 + above 50 DMA + volume spike)
+- Support bounce (price within 1.5% of 20-day support)
 """
 
 from __future__ import annotations
@@ -34,28 +34,28 @@ class TradeSignal:
 
 
 class HybridStrategy:
-    """Combines TradingAgents AI signals with RSI reversal for trade decisions.
+    """Multi-strategy scanner for paper trading.
 
-    Both layers must agree for a trade to execute:
-    1. TradingAgents provides BUY/SELL/HOLD with confidence
-    2. RSI confirms entry timing (RSI < 30 near support = BUY)
-    3. Learning rules can override either layer
+    Entry strategies (any one can trigger):
+    1. Oversold Bounce: RSI < 40 near support
+    2. Momentum: RSI 40-60, price > 50 DMA, volume spike
+    3. DMA Crossover: price crosses above 20 EMA
+    4. Support Bounce: price within 1.5% of support, RSI < 50
 
-    Dhan is used for execution; OpenAlgo provides optional strategy signals.
+    All strategies require AI signal confirmation (RSI fallback if no LLM).
     """
 
     def __init__(self, ai_signal_generator, broker_client, learning_rules: list[dict] | None = None):
         self.ai = ai_signal_generator
-        self.broker = broker_client  # Dhan broker for market data (LTP, candles)
+        self.broker = broker_client
         self.learning_rules = learning_rules or []
         self.watchlist = list(DEFAULT_WATCHLIST)
+        self._scan_count = 0
 
-        # Optional OpenAlgo strategy connection
         self._openalgo = None
         self._init_openalgo()
 
     def _init_openalgo(self):
-        """Connect to OpenAlgo for strategy signals if configured."""
         if settings.openalgo_api_key:
             try:
                 from core.openalgo_client import OpenAlgoClient
@@ -72,26 +72,18 @@ class HybridStrategy:
         self.learning_rules = rules
 
     def _should_skip(self, symbol: str, rsi: float, price: float) -> tuple[bool, str]:
-        """Check learning rules for skip conditions."""
         for rule in self.learning_rules:
             if not rule.get("is_active"):
                 continue
-
             condition = rule.get("condition_json", {})
-
-            # Symbol-specific rules
             blocked_symbols = condition.get("blocked_symbols", [])
             if symbol in blocked_symbols:
                 return True, f"Rule '{rule['rule_name']}': symbol blocked"
-
-            # RSI range rules
             rsi_min = condition.get("rsi_min")
             rsi_max = condition.get("rsi_max")
             if rsi_min is not None and rsi_max is not None:
                 if rsi_min <= rsi <= rsi_max:
                     return True, f"Rule '{rule['rule_name']}': RSI {rsi:.1f} in blocked range"
-
-            # Time-based rules
             time_block = condition.get("block_before_time")
             if time_block:
                 from datetime import datetime
@@ -101,94 +93,114 @@ class HybridStrategy:
                 h, m = map(int, time_block.split(":"))
                 if now.hour < h or (now.hour == h and now.minute < m):
                     return True, f"Rule '{rule['rule_name']}': blocked before {time_block}"
-
         return False, ""
 
-    async def _get_openalgo_signal(self, symbol: str) -> SignalAction | None:
-        """Get strategy signal from OpenAlgo if available.
-
-        OpenAlgo can provide additional strategy signals from its
-        built-in strategy engine (moving average crossovers, etc.)
-        This is used as an optional third confirmation layer.
-        """
-        if not self._openalgo:
-            return None
-
-        try:
-            positions = await self._openalgo.get_positions()
-            # If OpenAlgo already has a position in this symbol, it confirms the signal
-            for pos in positions:
-                if pos.get("symbol") == symbol:
-                    net_qty = int(pos.get("netqty", pos.get("net_qty", 0)))
-                    if net_qty > 0:
-                        return SignalAction.BUY
-                    elif net_qty < 0:
-                        return SignalAction.SELL
-            return SignalAction.HOLD
-        except Exception as e:
-            logger.debug(f"OpenAlgo signal unavailable for {symbol}: {e}")
-            return None
-
     async def scan(self) -> list[TradeSignal]:
-        """Scan watchlist for trade signals using hybrid AI + RSI approach."""
-        from core.indicators import compute_rsi, support_level, is_near_support
+        """Scan watchlist using multiple entry strategies."""
+        from core.indicators import compute_rsi, support_level, is_near_support, volume_spike, ema
 
+        self._scan_count += 1
         signals: list[TradeSignal] = []
         today_str = date.today().isoformat()
 
+        scanned = 0
+        ltp_failures = 0
+        candle_failures = 0
+        strategy_hits = {}
+
+        logger.info(f"=== Scan #{self._scan_count} starting ({len(self.watchlist)} symbols) ===")
+
         for symbol in self.watchlist:
             try:
-                # Get current price from Dhan broker
+                # Get current price
                 ltp = await self.broker.get_ltp(symbol)
                 if not ltp:
+                    ltp_failures += 1
                     continue
 
-                # Get historical candles for RSI computation (via Dhan)
+                scanned += 1
+
+                # Get candles for indicators
                 candles = await self._get_candles(symbol)
-                if candles is None or len(candles) < settings.rsi_period + 1:
+                if candles is None or len(candles) < 15:
+                    candle_failures += 1
                     continue
 
                 rsi_series = compute_rsi(candles, settings.rsi_period)
-                current_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else 50
+                current_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty and rsi_series.iloc[-1] is not None else 50
                 support = support_level(candles)
+                near_support = is_near_support(ltp, support, tolerance_pct=2.5)
+                has_volume_spike = volume_spike(candles, threshold=1.5)
 
-                # Check RSI condition (oversold near support)
-                rsi_buy = current_rsi < settings.rsi_oversold and is_near_support(ltp, support)
+                # Compute moving averages
+                ema20 = None
+                dma50 = None
+                if len(candles) >= 20:
+                    ema20_series = ema(candles, 20)
+                    ema20 = float(ema20_series.iloc[-1]) if not ema20_series.empty and ema20_series.iloc[-1] is not None else None
+                if len(candles) >= 50:
+                    from core.indicators import sma
+                    sma50_series = sma(candles, 50)
+                    dma50 = float(sma50_series.iloc[-1]) if not sma50_series.empty and sma50_series.iloc[-1] is not None else None
 
-                if not rsi_buy:
-                    continue  # RSI doesn't confirm, skip AI call to save LLM costs
+                # --- Entry Strategy Evaluation ---
+                entry_reason = None
+                entry_confidence_boost = 0.0
 
-                # Check learning rules before expensive AI call
+                # Strategy 1: Oversold Bounce (RSI < 40 near support)
+                if current_rsi < 40 and near_support:
+                    entry_reason = "OVERSOLD_BOUNCE"
+                    entry_confidence_boost = 0.15
+                    # Extra strong if deeply oversold
+                    if current_rsi < 30:
+                        entry_confidence_boost = 0.25
+
+                # Strategy 2: Momentum (RSI 40-60, price > DMA50, volume spike)
+                elif 40 <= current_rsi <= 60 and dma50 and ltp > dma50 and has_volume_spike:
+                    entry_reason = "MOMENTUM"
+                    entry_confidence_boost = 0.10
+
+                # Strategy 3: DMA Crossover (price just crossed above 20 EMA)
+                elif ema20 and len(candles) >= 2:
+                    prev_close = float(candles["close"].iloc[-2])
+                    if prev_close < ema20 and ltp >= ema20 and current_rsi < 65:
+                        entry_reason = "EMA_CROSSOVER"
+                        entry_confidence_boost = 0.10
+
+                # Strategy 4: Support Bounce (price near support, RSI < 50)
+                elif near_support and current_rsi < 50:
+                    entry_reason = "SUPPORT_BOUNCE"
+                    entry_confidence_boost = 0.05
+
+                if not entry_reason:
+                    continue
+
+                strategy_hits[entry_reason] = strategy_hits.get(entry_reason, 0) + 1
+
+                # Check learning rules
                 skip, skip_reason = self._should_skip(symbol, current_rsi, ltp)
                 if skip:
                     logger.info(f"Skipping {symbol}: {skip_reason}")
                     continue
 
-                # Get AI signal (only if RSI confirms)
+                # Get AI signal
                 ai_signal = await self.ai.get_signal(symbol, today_str)
 
-                # Both must agree on BUY
+                # AI must agree on BUY
                 if ai_signal.action != SignalAction.BUY:
-                    logger.info(
-                        f"{symbol}: RSI says BUY but AI says {ai_signal.action} "
-                        f"(confidence: {ai_signal.confidence:.2f}). Skipping."
+                    logger.debug(
+                        f"{symbol}: {entry_reason} but AI says {ai_signal.action}. Skipping."
                     )
                     continue
 
-                # Minimum AI confidence threshold
-                if ai_signal.confidence < 0.5:
-                    logger.info(
-                        f"{symbol}: AI confidence too low ({ai_signal.confidence:.2f}). Skipping."
-                    )
+                # Minimum confidence
+                if ai_signal.confidence < 0.4:
+                    logger.debug(f"{symbol}: AI confidence too low ({ai_signal.confidence:.2f})")
                     continue
 
-                # Optional: check OpenAlgo strategy signal as third layer
-                openalgo_signal = await self._get_openalgo_signal(symbol)
-                openalgo_boost = 0.05 if openalgo_signal == SignalAction.BUY else 0.0
-
-                # Combined confidence: weighted average (AI 60%, RSI 40%) + OpenAlgo boost
-                rsi_confidence = max(0, (settings.rsi_oversold - current_rsi) / settings.rsi_oversold)
-                combined = 0.6 * ai_signal.confidence + 0.4 * rsi_confidence + openalgo_boost
+                # Combined confidence
+                rsi_confidence = max(0, (50 - current_rsi) / 50)  # Higher when RSI is lower
+                combined = 0.5 * ai_signal.confidence + 0.3 * rsi_confidence + 0.2 * entry_confidence_boost + entry_confidence_boost
 
                 signals.append(TradeSignal(
                     symbol=symbol,
@@ -198,44 +210,46 @@ class HybridStrategy:
                     support=support,
                     ai_signal=ai_signal.action,
                     ai_confidence=ai_signal.confidence,
-                    ai_reasoning=ai_signal.reasoning,
+                    ai_reasoning=f"{entry_reason}: {ai_signal.reasoning[:200]}",
                     combined_confidence=combined,
                 ))
 
                 logger.info(
-                    f"Signal: BUY {symbol} @ ₹{ltp:.2f} | "
-                    f"RSI: {current_rsi:.1f} | AI: {ai_signal.confidence:.2f} | "
-                    f"OpenAlgo: {openalgo_signal or 'N/A'} | "
-                    f"Combined: {combined:.2f}"
+                    f"✅ Signal: BUY {symbol} @ ₹{ltp:.2f} | "
+                    f"RSI: {current_rsi:.1f} | Strategy: {entry_reason} | "
+                    f"AI: {ai_signal.confidence:.2f} | Combined: {combined:.2f}"
                 )
 
             except Exception as e:
                 logger.error(f"Error scanning {symbol}: {e}")
                 continue
 
-        # Sort by combined confidence (highest first)
+        # Log scan summary
+        logger.info(
+            f"=== Scan #{self._scan_count} complete: "
+            f"scanned={scanned}/{len(self.watchlist)} | "
+            f"ltp_fail={ltp_failures} | candle_fail={candle_failures} | "
+            f"signals={len(signals)} | strategies={strategy_hits} ==="
+        )
+
         signals.sort(key=lambda s: s.combined_confidence, reverse=True)
         return signals
 
     async def _get_candles(self, symbol: str, interval: str = "5") -> Any:
-        """Fetch OHLCV candles from Dhan API.
-
-        Uses Dhan SDK directly for historical data.
-        """
+        """Fetch OHLCV candles from Dhan API, with Yahoo Finance fallback."""
         from config.constants import DHAN_SECURITY_IDS
         from core.indicators import candles_from_dhan_data
 
         security_id = DHAN_SECURITY_IDS.get(symbol)
         if not security_id:
-            logger.warning(f"No Dhan security ID for {symbol}")
-            return None
+            # No Dhan ID — go straight to Yahoo
+            return await self._yahoo_candles(symbol)
 
         try:
             from dhanhq import dhanhq
             dhan = dhanhq(settings.dhan_client_id, settings.dhan_access_token)
             from datetime import datetime, timedelta
 
-            # Use intraday_minute_data for recent candles
             response = dhan.intraday_minute_data(
                 security_id=str(security_id),
                 exchange_segment=dhan.NSE,
@@ -243,11 +257,13 @@ class HybridStrategy:
             )
 
             if response and response.get("data"):
-                return candles_from_dhan_data(response["data"])
+                df = candles_from_dhan_data(response["data"])
+                if df is not None and len(df) >= 15:
+                    return df
 
-            # Fallback: historical daily data for longer term
+            # Fallback: historical daily
             to_date = datetime.now().strftime("%Y-%m-%d")
-            from_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            from_date = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
             response = dhan.historical_daily_data(
                 security_id=str(security_id),
                 exchange_segment=dhan.NSE,
@@ -257,20 +273,21 @@ class HybridStrategy:
             )
 
             if response and response.get("data"):
-                return candles_from_dhan_data(response["data"])
+                df = candles_from_dhan_data(response["data"])
+                if df is not None and len(df) >= 15:
+                    return df
         except Exception as e:
-            logger.error(f"Failed to fetch candles for {symbol} via Dhan: {e}")
+            logger.debug(f"Dhan candles failed for {symbol}: {e}")
 
-        # Fallback: Yahoo Finance for paper trading
         return await self._yahoo_candles(symbol)
 
     async def _yahoo_candles(self, symbol: str) -> Any:
-        """Fallback: fetch daily candles from Yahoo Finance for RSI computation."""
+        """Fallback: fetch daily candles from Yahoo Finance."""
         import aiohttp
         import pandas as pd
 
         yahoo_sym = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_sym}?interval=1d&range=1mo"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_sym}?interval=1d&range=3mo"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=8)) as resp:
@@ -292,7 +309,6 @@ class HybridStrategy:
                     df = df.dropna(subset=["close"])
                     if len(df) < 15:
                         return None
-                    logger.debug(f"Yahoo candles for {symbol}: {len(df)} rows")
                     return df
         except Exception as e:
             logger.debug(f"Yahoo candles fallback failed for {symbol}: {e}")
