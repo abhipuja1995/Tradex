@@ -1,7 +1,7 @@
 """Telegram bot with command handler for interactive control.
 
 Handles commands: /start, /status, /trades, /balance, /pnl,
-/pause, /resume, /stop, /rules, /watchlist, /tomorrow, /help
+/pause, /resume, /stop, /rules, /watchlist, /portfolio, /tomorrow, /help
 
 Runs as a long-polling bot alongside the trading engine.
 """
@@ -237,6 +237,7 @@ class TelegramBot:
             "/stop": self._cmd_stop,
             "/rules": self._cmd_rules,
             "/watchlist": self._cmd_watchlist,
+            "/portfolio": self._cmd_portfolio,
         }
 
         handler = handlers.get(command)
@@ -295,6 +296,7 @@ class TelegramBot:
             "📋 <b>Info</b>\n"
             "/rules — Active learning rules\n"
             "/watchlist — Current watchlist\n"
+            "/portfolio — Weekly portfolio P&L\n"
             "/help — This help message",
             chat_id,
         )
@@ -583,6 +585,17 @@ class TelegramBot:
 
         await self.send_message(text, chat_id)
 
+    async def _cmd_portfolio(self, chat_id: str):
+        """Show weekly portfolio P&L."""
+        await self.send_message("🔄 Updating portfolio prices...", chat_id)
+        try:
+            from core.weekly_portfolio import get_portfolio_summary
+            summary = await get_portfolio_summary()
+            await self.send_message(summary, chat_id)
+        except Exception as e:
+            logger.error(f"/portfolio error: {e}", exc_info=True)
+            await self.send_message(f"❌ Portfolio error: {str(e)[:200]}", chat_id)
+
     # ─── Daily Brief Builder ─────────────────────────────────────
 
     async def _build_daily_brief(self) -> str | None:
@@ -832,6 +845,16 @@ class TelegramBot:
                     pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
                     lines.append(f"   Closed: {len(closed_trades)} | PnL: {pnl_emoji} ₹{total_pnl:+.2f}")
                 lines.append("")
+        except Exception:
+            pass
+
+        # Weekly portfolio summary
+        try:
+            from core.weekly_portfolio import get_portfolio_summary
+            portfolio = await get_portfolio_summary()
+            if portfolio and "No active" not in portfolio:
+                lines.append("")
+                lines.append(portfolio)
         except Exception:
             pass
 

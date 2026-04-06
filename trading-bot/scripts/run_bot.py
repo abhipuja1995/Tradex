@@ -125,6 +125,115 @@ async def daily_brief_scheduler(telegram_bot):
         await asyncio.sleep(30)
 
 
+async def weekly_portfolio_scheduler(telegram_bot):
+    """Manage weekly portfolio: backfill, create new entries on Monday, update prices daily."""
+    from datetime import datetime, date
+    from zoneinfo import ZoneInfo
+
+    sched_logger = logging.getLogger("portfolio_scheduler")
+    ist = ZoneInfo("Asia/Kolkata")
+
+    # Check table exists first
+    try:
+        from db.client import ensure_weekly_portfolio_table
+        table_ok = await ensure_weekly_portfolio_table()
+        if not table_ok:
+            sched_logger.error(
+                "weekly_portfolio table missing! Run migrations/001_weekly_portfolio.sql "
+                "in Supabase SQL Editor. Portfolio scheduler will retry in 5 minutes."
+            )
+            await asyncio.sleep(300)
+            table_ok = await ensure_weekly_portfolio_table()
+            if not table_ok:
+                sched_logger.error("Table still missing. Portfolio scheduler exiting.")
+                return
+    except Exception as e:
+        sched_logger.error(f"Table check error: {e}")
+        return
+
+    # One-time backfill check on startup
+    try:
+        from db.client import get_weekly_portfolio
+        from core.weekly_portfolio import backfill_from_date
+
+        existing = await get_weekly_portfolio(status="OPEN")
+        if not existing:
+            sched_logger.info("No portfolio entries found — running March 31 backfill...")
+            backfill_date = date(2025, 3, 31)
+            entries = await backfill_from_date(backfill_date)
+            if entries:
+                sched_logger.info(f"Backfilled {len(entries)} entries from {backfill_date}")
+                if telegram_bot.enabled:
+                    from core.weekly_portfolio import get_portfolio_summary
+                    summary = await get_portfolio_summary()
+                    await telegram_bot.send_message(
+                        f"📊 <b>Weekly Portfolio Backfilled</b>\n"
+                        f"Starting from March 31, 2025\n\n{summary}"
+                    )
+            else:
+                sched_logger.warning("Backfill produced no entries")
+        else:
+            sched_logger.info(f"Portfolio has {len(existing)} open entries — skipping backfill")
+    except Exception as e:
+        sched_logger.error(f"Portfolio backfill error: {e}", exc_info=True)
+
+    done_today: set[str] = set()
+
+    while True:
+        now = datetime.now(ist)
+        today_key = now.strftime("%Y-%m-%d")
+
+        # Monday 9:00 AM IST — create new weekly portfolio from weekly picks
+        if now.weekday() == 0 and now.hour == 9 and 0 <= now.minute < 2:
+            key = f"{today_key}-weekly-create"
+            if key not in done_today:
+                sched_logger.info("Monday — creating new weekly portfolio entries")
+                try:
+                    from core.weekly_portfolio import create_weekly_portfolio, _fetch_yahoo_price
+                    from config.constants import DEFAULT_WATCHLIST
+                    import httpx
+
+                    picks = []
+                    async with httpx.AsyncClient(timeout=15.0) as session:
+                        for symbol in DEFAULT_WATCHLIST[:10]:
+                            price = await _fetch_yahoo_price(symbol, session)
+                            if price and price > 0:
+                                picks.append({"symbol": symbol, "price": round(price, 2)})
+
+                    if picks:
+                        # Take top 5 by cheapest
+                        picks.sort(key=lambda p: p["price"])
+                        entries = await create_weekly_portfolio(
+                            picks[:5], date.today(), source="weekly"
+                        )
+                        sched_logger.info(f"Created {len(entries)} weekly portfolio entries")
+                except Exception as e:
+                    sched_logger.error(f"Weekly portfolio creation error: {e}", exc_info=True)
+                done_today.add(key)
+
+        # Daily 9:30 AM IST — update portfolio prices
+        if now.hour == 9 and 30 <= now.minute < 32:
+            key = f"{today_key}-price-update"
+            if key not in done_today:
+                sched_logger.info("Updating weekly portfolio prices")
+                try:
+                    from core.weekly_portfolio import update_portfolio_prices
+                    result = await update_portfolio_prices()
+                    sched_logger.info(
+                        f"Portfolio update: {result['updated']} entries, "
+                        f"total P&L: ₹{result['total_pnl']:+,.0f}"
+                    )
+                except Exception as e:
+                    sched_logger.error(f"Portfolio price update error: {e}", exc_info=True)
+                done_today.add(key)
+
+        # Clean up at midnight
+        current_date = now.strftime("%Y-%m-%d")
+        done_today = {k for k in done_today if k.startswith(current_date)}
+
+        await asyncio.sleep(30)
+
+
 async def main():
     setup_logging()
     logger = logging.getLogger("run_bot")
@@ -179,6 +288,10 @@ async def main():
         # Daily brief scheduler (runs alongside bot)
         tasks.append(asyncio.create_task(daily_brief_scheduler(telegram_bot)))
         logger.info("Daily brief scheduler started (8:45 AM + 10:00 AM IST)")
+
+        # Weekly portfolio scheduler (backfill + auto-create + price updates)
+        tasks.append(asyncio.create_task(weekly_portfolio_scheduler(telegram_bot)))
+        logger.info("Weekly portfolio scheduler started")
     else:
         logger.info("Telegram bot disabled (no TELEGRAM_BOT_TOKEN)")
 

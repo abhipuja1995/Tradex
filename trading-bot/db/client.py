@@ -196,6 +196,90 @@ async def insert_ai_decision(decision: dict[str, Any]) -> dict[str, Any]:
     return result.data[0]
 
 
+# --- Weekly Portfolio ---
+
+async def ensure_weekly_portfolio_table() -> bool:
+    """Check if weekly_portfolio table exists by attempting a query.
+    Returns True if table exists, False otherwise (table must be created via SQL).
+    """
+    try:
+        supabase().table("weekly_portfolio").select("id").limit(1).execute()
+        return True
+    except Exception as e:
+        logger.warning(
+            f"weekly_portfolio table not found: {e}. "
+            "Run migrations/001_weekly_portfolio.sql in Supabase SQL Editor."
+        )
+        return False
+
+
+async def upsert_weekly_portfolio(entry: dict[str, Any]) -> dict[str, Any]:
+    if "id" not in entry:
+        entry["id"] = str(uuid4())
+    entry["updated_at"] = datetime.utcnow().isoformat()
+    result = supabase().table("weekly_portfolio").upsert(entry, on_conflict="id").execute()
+    return result.data[0]
+
+
+async def get_weekly_portfolio(
+    week_start_date: str | None = None,
+    status: str = "OPEN",
+) -> list[dict[str, Any]]:
+    query = supabase().table("weekly_portfolio").select("*")
+    if week_start_date:
+        query = query.eq("week_start_date", week_start_date)
+    if status:
+        query = query.eq("status", status)
+    result = query.order("entry_date", desc=True).execute()
+    return result.data
+
+
+async def get_all_portfolio_entries(limit: int = 100) -> list[dict[str, Any]]:
+    result = (
+        supabase().table("weekly_portfolio")
+        .select("*")
+        .order("entry_date", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return result.data
+
+
+async def update_weekly_portfolio_price(
+    entry_id: str, current_price: float, pnl: float, pnl_percent: float
+) -> dict[str, Any]:
+    result = (
+        supabase().table("weekly_portfolio")
+        .update({
+            "current_price": current_price,
+            "pnl": pnl,
+            "pnl_percent": pnl_percent,
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+        .eq("id", entry_id)
+        .execute()
+    )
+    return result.data[0]
+
+
+async def close_weekly_portfolio_entry(
+    entry_id: str, exit_price: float, pnl: float, pnl_percent: float
+) -> dict[str, Any]:
+    result = (
+        supabase().table("weekly_portfolio")
+        .update({
+            "current_price": exit_price,
+            "pnl": pnl,
+            "pnl_percent": pnl_percent,
+            "status": "CLOSED",
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+        .eq("id", entry_id)
+        .execute()
+    )
+    return result.data[0]
+
+
 async def get_ai_decisions(
     trade_date: date | None = None,
     symbol: str | None = None,

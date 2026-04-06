@@ -34,8 +34,8 @@ class Settings(BaseSettings):
 
     # Trading Parameters
     paper_trading: bool = True
-    daily_cap_inr: float = 840.0
-    per_trade_cap_inr: float = 168.0
+    daily_cap_inr: float = 50000.0
+    per_trade_cap_inr: float = 10000.0
     max_trades_per_day: int = 5
     stop_loss_percent: float = 1.0
     daily_max_loss_percent: float = 3.0

@@ -22,8 +22,8 @@ class RiskCheck:
 class RiskManager:
     """Enforces all trading risk rules:
 
-    1. Daily investment cap (₹840)
-    2. Per-trade cap (₹168)
+    1. Daily investment cap (₹50,000)
+    2. Per-trade cap (₹10,000)
     3. Max trades per day (5)
     4. Stop loss per trade (1%)
     5. Daily max loss (3% of daily cap)
