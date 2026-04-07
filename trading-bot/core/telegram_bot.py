@@ -75,7 +75,7 @@ class TelegramBot:
     # --- Message Sending ---
 
     async def send_message(self, text: str, chat_id: str | None = None) -> bool:
-        """Send a message to a Telegram chat."""
+        """Send a message to a Telegram chat. Auto-splits if > 4096 chars."""
         if not self.enabled:
             logger.debug(f"Telegram disabled. Would send: {text[:100]}...")
             return False
@@ -84,24 +84,48 @@ class TelegramBot:
         if not target:
             return False
 
-        try:
-            resp = await self._client.post(
-                f"{self.base_url}/sendMessage",
-                json={
-                    "chat_id": target,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-            )
-            if resp.status_code == 401:
-                logger.error("Telegram sendMessage: 401 Unauthorized — token is invalid")
-                return False
-            resp.raise_for_status()
-            return True
-        except Exception as e:
-            logger.error(f"Telegram send failed: {e}")
-            return False
+        # Telegram max message length is 4096 chars — split if needed
+        chunks = self._split_message(text, max_len=4000)
+
+        all_ok = True
+        for chunk in chunks:
+            try:
+                resp = await self._client.post(
+                    f"{self.base_url}/sendMessage",
+                    json={
+                        "chat_id": target,
+                        "text": chunk,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                )
+                if resp.status_code == 401:
+                    logger.error("Telegram sendMessage: 401 Unauthorized — token is invalid")
+                    return False
+                resp.raise_for_status()
+            except Exception as e:
+                logger.error(f"Telegram send failed: {e}")
+                all_ok = False
+        return all_ok
+
+    @staticmethod
+    def _split_message(text: str, max_len: int = 4000) -> list[str]:
+        """Split a long message into chunks at newline boundaries."""
+        if len(text) <= max_len:
+            return [text]
+
+        chunks = []
+        while text:
+            if len(text) <= max_len:
+                chunks.append(text)
+                break
+            # Find last newline within limit
+            split_at = text.rfind("\n", 0, max_len)
+            if split_at <= 0:
+                split_at = max_len
+            chunks.append(text[:split_at])
+            text = text[split_at:].lstrip("\n")
+        return chunks
 
     # --- Polling Loop ---
 
