@@ -153,27 +153,26 @@ async def weekly_portfolio_scheduler(telegram_bot):
 
     # One-time backfill check on startup
     try:
-        from db.client import get_weekly_portfolio
-        from core.weekly_portfolio import backfill_from_date
+        from db.client import get_weekly_portfolio, get_all_portfolio_entries
+        from core.weekly_portfolio import backfill_all_weeks, get_portfolio_summary
 
-        existing = await get_weekly_portfolio(status="OPEN")
-        if not existing:
-            sched_logger.info("No portfolio entries found — running March 31 backfill...")
+        all_entries = await get_all_portfolio_entries(limit=1)
+        if not all_entries:
+            sched_logger.info("No portfolio history — backfilling weekly from March 31...")
             backfill_date = date(2025, 3, 31)
-            entries = await backfill_from_date(backfill_date)
+            entries = await backfill_all_weeks(backfill_date)
             if entries:
                 sched_logger.info(f"Backfilled {len(entries)} entries from {backfill_date}")
                 if telegram_bot.enabled:
-                    from core.weekly_portfolio import get_portfolio_summary
                     summary = await get_portfolio_summary()
                     await telegram_bot.send_message(
                         f"📊 <b>Weekly Portfolio Backfilled</b>\n"
-                        f"Starting from March 31, 2025\n\n{summary}"
+                        f"From March 31, 2025 — weekly rotation\n\n{summary}"
                     )
             else:
                 sched_logger.warning("Backfill produced no entries")
         else:
-            sched_logger.info(f"Portfolio has {len(existing)} open entries — skipping backfill")
+            sched_logger.info("Portfolio history exists — skipping backfill")
     except Exception as e:
         sched_logger.error(f"Portfolio backfill error: {e}", exc_info=True)
 
@@ -183,32 +182,31 @@ async def weekly_portfolio_scheduler(telegram_bot):
         now = datetime.now(ist)
         today_key = now.strftime("%Y-%m-%d")
 
-        # Monday 9:00 AM IST — create new weekly portfolio from weekly picks
+        # Monday 9:00 AM IST — ROTATE: close last week + create new picks
         if now.weekday() == 0 and now.hour == 9 and 0 <= now.minute < 2:
-            key = f"{today_key}-weekly-create"
+            key = f"{today_key}-weekly-rotate"
             if key not in done_today:
-                sched_logger.info("Monday — creating new weekly portfolio entries")
+                sched_logger.info("Monday — rotating weekly portfolio")
                 try:
-                    from core.weekly_portfolio import create_weekly_portfolio, _fetch_yahoo_price
-                    from config.constants import DEFAULT_WATCHLIST
-                    import httpx
+                    from core.weekly_portfolio import rotate_weekly_portfolio, get_portfolio_summary
 
-                    picks = []
-                    async with httpx.AsyncClient(timeout=15.0) as session:
-                        for symbol in DEFAULT_WATCHLIST[:10]:
-                            price = await _fetch_yahoo_price(symbol, session)
-                            if price and price > 0:
-                                picks.append({"symbol": symbol, "price": round(price, 2)})
+                    result = await rotate_weekly_portfolio()
+                    sched_logger.info(
+                        f"Rotation done: closed {result['closed']} entries "
+                        f"(P&L: ₹{result['total_pnl']:+,.0f}), "
+                        f"created {result['created']} new entries"
+                    )
 
-                    if picks:
-                        # Take top 5 by cheapest
-                        picks.sort(key=lambda p: p["price"])
-                        entries = await create_weekly_portfolio(
-                            picks[:5], date.today(), source="weekly"
+                    if telegram_bot.enabled:
+                        picks_str = ", ".join(result.get("picks", []))
+                        summary = await get_portfolio_summary()
+                        await telegram_bot.send_message(
+                            f"🔄 <b>Weekly Portfolio Rotated</b>\n"
+                            f"Last week P&L: ₹{result['total_pnl']:+,.0f}\n"
+                            f"New picks: {picks_str}\n\n{summary}"
                         )
-                        sched_logger.info(f"Created {len(entries)} weekly portfolio entries")
                 except Exception as e:
-                    sched_logger.error(f"Weekly portfolio creation error: {e}", exc_info=True)
+                    sched_logger.error(f"Weekly rotation error: {e}", exc_info=True)
                 done_today.add(key)
 
         # Daily 9:30 AM IST — update portfolio prices
